@@ -1,0 +1,288 @@
+# Networking lab 3: BGP between two autonomous systems
+# Routers and hosts are network namespaces in this one VM, with FRRouting on each router.
+# Everything is installed by the setup below, from Ubuntu's archive, the first time it starts.
+cpus: 2
+memory: 2048    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq frr tcpdump traceroute iproute2 netcat-openbsd iputils-ping python3
+  # FRRouting's own service would run one router in the VM itself; every router here is a namespace.
+  systemctl disable --now frr >/dev/null 2>&1
+  mkdir -p /etc/netlab
+  cat > /usr/local/bin/netlab <<'NETLAB_TOOL_END'
+  #!/usr/bin/env python3
+  """netlab: routers and hosts as network namespaces in this VM, from /etc/netlab/topology.
+    netlab up | down | reset | status | shell <node> [-l]
+  Real tools work too: ip netns exec <node> <command>, vtysh -N <router>."""
+  import ipaddress, os, shutil, subprocess as sp, sys, time
+
+  TOPO = '/etc/netlab/topology'
+  FRR = ['zebra', 'mgmtd', 'staticd']
+
+  def run(*a, ns=None, quiet=False, log=None):
+      c = ['ip', 'netns', 'exec', ns, *a] if ns else list(a)
+      # A daemon keeps its output open, so it is sent to a file and never to our pipe.
+      out = open(log, 'ab') if log else sp.PIPE
+      r = sp.run(c, stdin=sp.DEVNULL, stdout=out, stderr=sp.STDOUT if log else sp.PIPE, text=not log)
+      if r.returncode and not quiet:
+          sys.exit('netlab: %s: %s' % (' '.join(c), r.stderr.strip()))
+      return r
+
+  def load():
+      routers, hosts, links, more = [], [], [], []
+      for line in open(TOPO):
+          w = line.split('#')[0].split()
+          if not w: continue
+          {'router': routers, 'host': hosts, 'link': links, 'daemons': more}[w[0]].extend(
+              [w[1:]] if w[0] == 'link' else w[1:])
+      return routers, hosts, links, more
+
+  def up():
+      routers, hosts, links, more = load()
+      if run('ip', 'netns', 'list').stdout.strip():
+          sys.exit('netlab: already up (netlab reset starts it again)')
+      for n in routers + hosts:
+          run('ip', 'netns', 'add', n)
+          run('ip', 'link', 'set', 'lo', 'up', ns=n)
+          run('sysctl', '-qw', 'net.ipv4.ip_forward=' + str(int(n in routers)), ns=n)
+      for a, b, net in links:
+          net = ipaddress.ip_network(net)
+          ends = list(net.hosts())[:2]
+          run('ip', 'link', 'add', 'to-' + b, 'netns', a, 'type', 'veth',
+              'peer', 'name', 'to-' + a, 'netns', b)
+          for me, peer, mine, theirs in ((a, b, ends[0], ends[1]), (b, a, ends[1], ends[0])):
+              run('ip', 'addr', 'add', '%s/%d' % (mine, net.prefixlen), 'dev', 'to-' + peer, ns=me)
+              run('ip', 'link', 'set', 'to-' + peer, 'up', ns=me)
+              if me in hosts:
+                  run('ip', 'route', 'add', 'default', 'via', str(theirs), ns=me)
+      for r in routers:
+          conf, sock = '/etc/frr/' + r, '/run/frr/' + r
+          os.makedirs(conf, exist_ok=True)
+          os.makedirs(sock, exist_ok=True)
+          if not os.path.exists(conf + '/frr.conf'):
+              open(conf + '/frr.conf', 'w').write('frr defaults traditional\nhostname %s\n'
+                                                  'service integrated-vtysh-config\n' % r)
+          open(conf + '/vtysh.conf', 'w').write('service integrated-vtysh-config\n')
+          for d in (conf, sock, conf + '/frr.conf'):
+              shutil.chown(d, 'frr', 'frr')
+          for d in FRR + more:
+              run('/usr/lib/frr/' + d, '-d', '-N', r, '-A', '127.0.0.1', '-u', 'frr',
+                  '-g', 'frr', '--vty_socket', sock, ns=r, log='/var/log/netlab.log')
+      for r in routers:
+          for _ in range(50):
+              if not run('vtysh', '-N', r, '-b', quiet=True).returncode: break
+              time.sleep(0.2)
+      print('netlab: up: ' + ' '.join(routers + hosts))
+
+  def down():
+      routers, hosts, links, more = load()
+      run('pkill', '-f', '/usr/lib/frr/.* -N ', quiet=True)
+      time.sleep(0.5)
+      for n in routers + hosts:
+          run('ip', 'netns', 'del', n, quiet=True)
+          shutil.rmtree('/run/frr/' + n, ignore_errors=True)
+
+  def status():
+      routers, hosts, links, more = load()
+      for n in routers + hosts:
+          print('%s (%s)' % (n, 'router' if n in routers else 'host'))
+          out = run('ip', '-br', '-4', 'addr', ns=n, quiet=True).stdout
+          if not out: sys.exit('netlab: not up (netlab reset)')
+          for l in out.splitlines():
+              if not l.startswith('lo '):
+                  w = l.split()
+                  print('  %s %s' % (w[0].split('@')[0], w[2]))
+          if n in routers:
+              running = [d for d in FRR + more if os.path.exists('/run/frr/%s/%s.pid' % (n, d))]
+              print('  daemons: ' + ' '.join(running))
+
+  def shell(n, linux):
+      routers, hosts, links, more = load()
+      if n not in routers + hosts:
+          sys.exit('netlab: no node %s (one of: %s)' % (n, ' '.join(routers + hosts)))
+      if n in routers and not linux:
+          sp.call(['unshare', '-u', 'sh', '-c', 'hostname $0; exec vtysh -N $0', n])  # prompt: r1#
+          sp.call(['vtysh', '-N', n, '-c', 'write memory'], stdout=sp.DEVNULL)  # keep what was typed
+          return
+      os.makedirs('/run/netlab', exist_ok=True)
+      rc = '/run/netlab/%s.rc' % n
+      open(rc, 'w').write("PS1='%s# '\nalias vtysh='vtysh -N %s'\n" % (n, n))
+      os.execvp('ip', ['ip', 'netns', 'exec', n, 'bash', '--rcfile', rc, '-i'])
+
+  if os.geteuid():
+      os.execvp('sudo', ['sudo', sys.executable] + sys.argv)
+  cmd, args = (sys.argv[1:2] or ['status'])[0], sys.argv[2:]
+  if cmd == 'up': up()
+  elif cmd == 'down': down()
+  elif cmd == 'reset':
+      down()
+      for r in load()[0]: shutil.rmtree('/etc/frr/' + r, ignore_errors=True)
+      up()
+  elif cmd == 'status': status()
+  elif cmd == 'shell' and args: shell(args[0], '-l' in args)
+  else: sys.exit(__doc__)
+  NETLAB_TOOL_END
+  chmod 755 /usr/local/bin/netlab
+  cat > /etc/netlab/topology <<'NETLAB_TOPOLOGY_END'
+  # routers, hosts, then links: "link A B subnet" gives A the first address, B the second.
+  daemons bgpd
+  router r1 r2
+  host h1 h2 priv
+  link r1 h1 10.0.1.0/24
+  link r1 r2 10.0.12.0/24
+  link r2 h2 10.0.3.0/24
+  link r2 priv 192.168.99.0/24
+  NETLAB_TOPOLOGY_END
+  cat > /etc/systemd/system/netlab.service <<'NETLAB_UNIT_END'
+  [Unit]
+  Description=Network lab: routers and hosts as namespaces
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/netlab up
+  ExecStop=/usr/local/bin/netlab down
+
+  [Install]
+  WantedBy=multi-user.target
+  NETLAB_UNIT_END
+  systemctl daemon-reload
+  systemctl enable netlab >/dev/null 2>&1
+  home=/home/student
+  [ -d $home ] || home=/root
+  cat > $home/README.md <<'NETLAB_README_END'
+  # Lab: BGP between two autonomous systems
+
+  Five machines, built in this VM. r1 is the whole of AS 65001 and r2 the whole of AS 65002.
+  Each router is a namespace running FRRouting with its BGP daemon started and nothing
+  configured.
+
+      AS 65001                 AS 65002
+      h1 --- r1 ------------- r2 --- h2
+                              \
+                               priv  (a private network, 192.168.99.0/24)
+
+  | link      | network          | first address | second address    |
+  |-----------|------------------|---------------|-------------------|
+  | h1 - r1   | 10.0.1.0/24      | r1 10.0.1.1   | h1 10.0.1.2       |
+  | r1 - r2   | 10.0.12.0/24     | r1 10.0.12.1  | r2 10.0.12.2      |
+  | r2 - h2   | 10.0.3.0/24      | r2 10.0.3.1   | h2 10.0.3.2       |
+  | r2 - priv | 192.168.99.0/24  | r2 192.168.99.1 | priv 192.168.99.2 |
+
+  Every host's default route already points at its router.
+
+  ## What to do
+
+  1. Ping h2 (10.0.3.2) from h1. It fails: r1 has never heard of that network.
+  2. Make r1 and r2 neighbours across the link between them, each in its own AS, and watch
+     the session come up (`show bgp summary`).
+  3. Make each AS announce the network its host lives on, and see what each router has learned
+     (`show bgp ipv4 unicast`, `show ip route bgp`). If the session is up and nothing is
+     exchanged, look up `ebgp-requires-policy` in FRRouting's documentation.
+  4. Ping and `traceroute -n` from h1 to h2.
+  5. The private network behind r2 belongs to AS 65002 alone: announce nothing that would let
+     h1 reach it.
+  6. Save both routers (`write memory`, or just leave `netlab shell`).
+
+  ## The tools
+
+  - `netlab status`            every machine and its addresses
+  - `netlab shell <name>`      a host gets a shell; a router gets its FRRouting console (vtysh).
+                               Leaving it saves the router's configuration
+  - `netlab shell <name> -l`   a shell inside a router instead of vtysh
+  - `netlab reset`             forget every configuration and start the lab again
+  - `sudo ip netns exec h1 ping 10.0.3.2`    what netlab shell does, by hand: run anything in a machine
+  - `sudo vtysh -N r1`         the same FRRouting console for r1
+  - `sudo ip netns exec r1 tcpdump -ni to-r2`    watch a link (the interfaces are called to-<neighbour>)
+  - `traceroute -n`, `ip route`, `ip -br addr` and `nc` work in any machine the same way
+
+  In vtysh, `?` lists what you can type, `show running-config` shows what a router is set to,
+  and **`write memory` saves it**: only what is saved is kept when the VM restarts and is what
+  your teacher's check reads.
+  NETLAB_README_END
+  chown student:student $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  systemctl start netlab 2>/dev/null || netlab up
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  ROUTERS="r1 r2"; HOSTS="h1 h2 priv"; H2=10.0.3.2; PRIVATE=192.168.99.2
+  PATH_WANTED="10.0.1.1 10.0.12.2 10.0.3.2"
+  TABLE="r1 to-h1 10.0.1.1/24
+  r1 to-r2 10.0.12.1/24
+  r2 to-r1 10.0.12.2/24
+  r2 to-h2 10.0.3.1/24
+  r2 to-priv 192.168.99.1/24
+  h1 to-r1 10.0.1.2/24
+  h2 to-r2 10.0.3.2/24
+  priv to-r2 192.168.99.2/24"
+  fail() {
+    echo "NOT PASSED: $*"
+    for r in $ROUTERS; do echo "--- $r routes"; ip -n $r route 2>&1 | head -12; done
+    exit 1
+  }
+  for i in $(seq 1 40); do
+    ip netns list | grep -qw r1 && vtysh -N r1 -c "show version" >/dev/null 2>&1 && break
+    sleep 2
+  done
+  ip netns list | grep -qw r1 || netlab up >/dev/null 2>&1
+  vt() { r=$1; shift; vtysh -N $r -c "$*" 2>/dev/null; }
+  # The machines are as they were built: every address, and nothing else on any of them.
+  while read n d a; do
+    ip -n $n -4 -o addr show dev $d 2>/dev/null | grep -q " $a " || fail "$n should have $a on $d: the topology was changed"
+  done <<TOPOLOGY_END
+  $TABLE
+  TOPOLOGY_END
+  for n in $ROUTERS $HOSTS; do
+    want=$(echo "$TABLE" | grep -c "^$n ")
+    have=$(ip -n $n -4 -o addr show | grep -vc " lo ")
+    [ "$want" = "$have" ] || fail "$n has addresses that were added: $have, not $want"
+    [ "$(ip -n $n -4 -o addr show dev lo | wc -l)" = 1 ] || fail "$n has an extra address on lo"
+    ip netns exec $n nft list ruleset 2>/dev/null | grep -q . && fail "$n has firewall or NAT rules"
+    ip netns exec $n iptables-save 2>/dev/null | grep -q '^-' && fail "$n has firewall or NAT rules"
+  done
+  for r in $ROUTERS; do
+    [ "$(ip netns exec $r sysctl -n net.ipv4.ip_forward)" = 1 ] || fail "$r does not forward"
+    vt $r "show running-config" | grep -q '^ip route' && SAVED="$SAVED $r"
+    [ -z "$(ip -n $r route show proto static; ip -n $r route show proto boot)" ] || HAND="$HAND $r"
+  done
+  [ -z "$HAND" ] || fail "routes typed with ip route are lost when the VM restarts, on:$HAND: configure them in vtysh and write memory"
+
+  [ -z "$SAVED" ] || fail "static routes were used instead of BGP on:$SAVED"
+  for r in $ROUTERS; do
+    vt $r "show running-config" | grep -q '^router bgp' || fail "$r has no BGP configured, or it was not saved (write memory)"
+  done
+  # One session, established, between two different autonomous systems.
+  peer() { vt $1 "show bgp summary json" | python3 -c 'import json,sys
+  try:
+      d = json.load(sys.stdin)["ipv4Unicast"]
+      p = list(d["peers"].values())[0]
+      print(d["as"], p["remoteAs"], p["state"])
+  except Exception: print("0 0 none")'; }
+  for i in $(seq 1 60); do
+    [ "$(peer r1)" = "65001 65002 Established" ] && [ "$(peer r2)" = "65002 65001 Established" ] && break
+    sleep 3
+  done
+  [ "$(peer r1)" = "65001 65002 Established" ] || fail "r1 (AS 65001) has no Established session with AS 65002: (own AS, remote AS, state) is $(peer r1)"
+  [ "$(peer r2)" = "65002 65001 Established" ] || fail "r2 (AS 65002) has no Established session with AS 65001: (own AS, remote AS, state) is $(peer r2)"
+  # What each router knows was learned by BGP.
+  for t in "r1 10.0.3.0/24" "r2 10.0.1.0/24"; do
+    set -- $t
+    for i in 1 2 3 4 5 6 7 8 9 10; do ip -n $1 route show $2 proto bgp | grep -q via && break; sleep 3; done
+    ip -n $1 route show $2 proto bgp | grep -q via || fail "$1 has no BGP route to $2: is each AS announcing its network, and allowed to (ebgp-requires-policy)?"
+  done
+  ip -n r1 route show 192.168.99.0/24 | grep -q . && fail "r1 learned 192.168.99.0/24: AS 65002 must not announce its private network"
+  ip netns exec h1 ping -c 3 -W 2 -q $H2 >/dev/null 2>&1 || fail "h1 cannot reach h2 at $H2"
+  hops=$(ip netns exec h1 traceroute -n -q 1 -w 2 -m 8 $H2 2>/dev/null | awk 'NR>1 {printf "%s ", $2}')
+  [ "$hops" = "$PATH_WANTED " ] || fail "h1 reaches h2 but not through the routers: path was $hops, expected $PATH_WANTED"
+  ip netns exec h1 ping -c 2 -W 1 -q $PRIVATE >/dev/null 2>&1 && fail "h1 can reach $PRIVATE, which must stay private: the routes are wider than the lab asks"
+  echo "PASSED: the BGP session is Established, h1 reaches h2 over routes BGP learned, and the private network is not announced"
