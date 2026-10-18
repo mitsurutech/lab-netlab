@@ -1,5 +1,7 @@
 # Networking labs in one VM: static routing, OSPF and BGP with FRRouting
 
+[English](README.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [Español](README.es.md)
+
 [![check](https://github.com/mitsurutech/lab-netlab/actions/workflows/check.yml/badge.svg)](https://github.com/mitsurutech/lab-netlab/actions/workflows/check.yml)
 
 Three ready-made **computer networking labs** for classrooms, from the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning), where schools and colleges give every student their own machines and terminal in the browser. Each student gets their own Ubuntu VM with a small network built inside it, **routers running FRRouting** and hosts to ping from, and learns **static routing, OSPF and BGP** on the same `vtysh` console they will meet on real equipment. Nothing is installed on the student's computer and no Cisco licence is needed.
@@ -50,12 +52,12 @@ On every push, `.github/workflows/check.yml` checks that each file is valid YAML
 
 The VM reaches Ubuntu's package archive, PyPI, npm and GitHub, and nothing else, so a lab cannot be pointed at a host on the internet. It is one VM, so there is no second machine to attack from or to; a topology of several routers is built inside it.
 
+## Licence
+
+This work is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). You may share it and adapt it for learning and teaching, if you credit Mitsuru Technologies Ltd, do not use it commercially, and share anything you make from it under the same licence. The full text is in the `LICENSE` file. It covers the lab definitions, the `netlab` tool and this documentation. [FRRouting](https://frrouting.org) is GPL-2.0 licensed and is installed from Ubuntu's archive when a VM starts; nothing of it is distributed here.
+
 ## About
 
 Made by [Mitsuru Technologies](https://mitsurutech.co.uk) for the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning): Python, Java, Go, Node, SQL and Linux in the browser for schools and colleges, with container labs, VM labs, web apps deployed from GitHub, and quizzes that mark themselves. Try code with no account in the [playground](https://mitsurutech.co.uk/playground).
 
 More labs from the same place: [lab-juice-shop](https://github.com/mitsurutech/lab-juice-shop), [lab-dvwa](https://github.com/mitsurutech/lab-dvwa), [lab-webgoat](https://github.com/mitsurutech/lab-webgoat), [lab-mysql-phpmyadmin](https://github.com/mitsurutech/lab-mysql-phpmyadmin), [lab-git-gitea](https://github.com/mitsurutech/lab-git-gitea) and [lab-sample](https://github.com/mitsurutech/lab-sample).
-
-## Licence
-
-The lab definitions, the `netlab` tool and this documentation are MIT licensed, see [LICENSE](LICENSE): copy them, change them, teach with them. [FRRouting](https://frrouting.org) is GPL-2.0 licensed and is installed from Ubuntu's archive when a VM starts; nothing of it is distributed here.
